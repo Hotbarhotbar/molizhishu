@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from dedup import dedup_candidates
+from llm_client import LLMClient, LLMConfig, parse_json_object
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -687,6 +688,138 @@ def title_direction(score: ScoreResult) -> str:
     return title
 
 
+def generated_title_direction(score: ScoreResult) -> str:
+    return score.candidate.get("llm_title_direction") or title_direction(score)
+
+
+def generated_angle(score: ScoreResult) -> str:
+    return score.candidate.get("llm_topic_angle") or (
+        "不只转述热点，重点回答服务商怎样把争论变成可监测指标。"
+        if score.total >= 12
+        else "先储备，等待事实锚点补强。"
+    )
+
+
+def generated_risk(score: ScoreResult) -> str:
+    return score.candidate.get("llm_risk_note") or score.risk
+
+
+def generated_service_hook(score: ScoreResult) -> str:
+    return score.candidate.get("llm_service_hook") or "客户沟通 / 交付验收 / 报告复盘 / 风险预警"
+
+
+def env_flag(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def llm_requested(args: argparse.Namespace) -> bool:
+    return bool(args.use_llm or env_flag("USE_LLM"))
+
+
+def build_llm_messages(score: ScoreResult) -> list[dict[str, str]]:
+    candidate = score.candidate
+    payload = {
+        "title": candidate.get("title", ""),
+        "snippet": candidate.get("snippet", ""),
+        "topic_type": candidate.get("topic_type", ""),
+        "topic_basis": candidate.get("topic_basis", ""),
+        "score": {
+            "user_value": score.user_value,
+            "differentiation": score.differentiation,
+            "spread": score.spread,
+            "total": score.total,
+        },
+        "capabilities": score.capabilities,
+        "risk": score.risk,
+    }
+    return [
+        {
+            "role": "system",
+            "content": (
+                "你是模力指数公众号的选题编辑。只根据用户给定材料生成选题增强字段，"
+                "不要编造未给出的事实，不要承诺排名、霸屏或保证效果。"
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                "请把下面候选改写成更适合飞书日报和 Markdown Brief 的选题字段。\n"
+                "只输出 JSON 对象，不要输出 Markdown，不要解释。\n"
+                "字段：\n"
+                "- title_direction：不超过45字，像公众号选题方向，不要夸张。\n"
+                "- topic_angle：不超过60字，说明服务商视角的切入角度。\n"
+                "- service_hook：不超过45字，说明落到客户沟通/交付/验收/续费/报告哪一环。\n"
+                "- risk_note：不超过60字，说明发布前最大事实或表达风险。\n\n"
+                f"候选材料：{json.dumps(payload, ensure_ascii=False)}"
+            ),
+        },
+    ]
+
+
+def apply_llm_enhancements(
+    scores: list[ScoreResult],
+    args: argparse.Namespace,
+) -> tuple[str, list[str]]:
+    if not llm_requested(args):
+        return "未启用", []
+
+    config = LLMConfig.from_sources(
+        provider=args.llm_provider,
+        base_url=args.llm_base_url,
+        api_key=args.llm_api_key,
+        model=args.llm_model,
+        timeout=args.llm_timeout,
+        temperature=args.llm_temperature,
+        max_tokens=args.llm_max_tokens,
+    )
+    missing = config.missing_reason()
+    if missing:
+        return f"已请求但未配置：{missing}", [missing]
+
+    client = LLMClient(config)
+    warnings: list[str] = []
+    success = 0
+
+    for index, score in enumerate(scores, start=1):
+        result = client.chat(build_llm_messages(score))
+        if not result.ok:
+            warnings.append(f"llm_enhance_failed_{index}: {result.error}")
+            continue
+
+        parsed = parse_json_object(result.content)
+        if not parsed:
+            warnings.append(f"llm_enhance_invalid_json_{index}")
+            continue
+
+        field_map = {
+            "llm_title_direction": "title_direction",
+            "llm_topic_angle": "topic_angle",
+            "llm_service_hook": "service_hook",
+            "llm_risk_note": "risk_note",
+        }
+        for local_key, remote_key in field_map.items():
+            value = compact_text(parsed.get(remote_key), 120)
+            if value:
+                score.candidate[local_key] = value
+        success += 1
+
+    return f"已启用 {config.provider}/{config.model}，成功 {success}/{len(scores)} 条", warnings
+
+
+def feishu_topic_title(score: ScoreResult) -> str:
+    return compact_text(score.candidate.get("llm_title_direction") or score.candidate.get("title", "-"), 56)
+
+
+def feishu_topic_angle(score: ScoreResult) -> str:
+    if score.candidate.get("llm_topic_angle"):
+        return compact_text(score.candidate["llm_topic_angle"], 80)
+    if score.total >= 12:
+        return "把热点翻译成服务商客户报告里的监测指标"
+    if score.total >= 9:
+        return "先储备，等官方来源、报告数据或客户案例补强"
+    return score.reason
+
+
 def render_branch_review(branches: list[BranchResult]) -> list[str]:
     lines = [
         "## 六类采集复盘",
@@ -718,7 +851,7 @@ def render_recommended(scores: list[ScoreResult]) -> list[str]:
         candidate = score.candidate
         lines.extend(
             [
-                f"### {index}. {title_direction(score)}",
+                f"### {index}. {generated_title_direction(score)}",
                 "",
                 "| 字段 | 内容 |",
                 "|---|---|",
@@ -729,10 +862,10 @@ def render_recommended(scores: list[ScoreResult]) -> list[str]:
                 f"| 事实口径 | {table_cell('本地采集样本；正式发布前需核验原文链接' if candidate.get('url') else '本地样本；缺少原文链接，需补证')} |",
                 f"| 选题依据 | {table_cell(candidate.get('topic_basis'))} |",
                 f"| 产品主能力 | {table_cell('、'.join(score.capabilities) if score.capabilities else '暂不承接')} |",
-                f"| 服务商落点 | 客户沟通 / 交付验收 / 报告复盘 / 风险预警 |",
-                f"| 差异化角度 | 不只转述热点，重点回答服务商怎样把争论变成可监测指标。 |",
-                f"| 标题方向 | {table_cell(title_direction(score))} |",
-                f"| 最大风险 | {table_cell(score.risk)} |",
+                f"| 服务商落点 | {table_cell(generated_service_hook(score))} |",
+                f"| 差异化角度 | {table_cell(generated_angle(score))} |",
+                f"| 标题方向 | {table_cell(generated_title_direction(score))} |",
+                f"| 最大风险 | {table_cell(generated_risk(score))} |",
                 f"| 发布结论预判 | {'可发' if score.total >= 12 else '需补证'} |",
                 "",
                 "#### 三维评分",
@@ -769,7 +902,7 @@ def render_reserve(scores: list[ScoreResult]) -> list[str]:
 
     for index, score in enumerate(scores, start=1):
         lines.append(
-            f"| {index} | {table_cell(title_direction(score))} | "
+            f"| {index} | {table_cell(generated_title_direction(score))} | "
             f"{table_cell(score.candidate.get('topic_type'))} | {score.total}/15 | "
             f"{table_cell(score.reason)} | 补到官方来源、报告数据或客户案例后激活 |"
         )
@@ -801,10 +934,12 @@ def render_quality_review(
     knowledge_loaded: list[str],
     knowledge_warnings: list[str],
     feishu_status: str,
+    llm_status: str,
 ) -> list[str]:
     lines = ["## 搜索质量复盘", ""]
     all_warnings = warnings + branch_warnings + knowledge_warnings
     lines.append(f"- 知识库增强：{'已加载 ' + str(len(knowledge_loaded)) + ' 个文件' if knowledge_loaded else '可选跳过'}")
+    lines.append(f"- 模型增强：{llm_status}")
     lines.append("- 历史文章去重：未启用（按MVP要求，本轮不读取已发文章做排除）")
     lines.append(f"- 飞书推送：{feishu_status}")
     if not all_warnings:
@@ -831,6 +966,7 @@ def render_markdown(
     knowledge_loaded: list[str],
     knowledge_warnings: list[str],
     feishu_status: str,
+    llm_status: str,
 ) -> str:
     all_empty = raw_count == 0 and cleaned_count == 0 and deduped_count == 0
     conclusion = (
@@ -877,6 +1013,7 @@ def render_markdown(
             knowledge_loaded=knowledge_loaded,
             knowledge_warnings=knowledge_warnings,
             feishu_status=feishu_status,
+            llm_status=llm_status,
         )
     )
     lines.extend(
@@ -891,6 +1028,88 @@ def render_markdown(
         ]
     )
     return "\n".join(lines)
+
+
+def truncate_message(text: str, limit: int = 3500) -> str:
+    text = text.replace("\r\n", "\n").replace("\r", "\n").strip()
+    if len(text) <= limit:
+        return text
+    suffix = "\n\n（消息过长，已截断；完整内容见本地 Markdown 日报。）"
+    return text[: limit - len(suffix)].rstrip() + suffix
+
+
+def render_feishu_message(
+    run_date: date,
+    branches: list[BranchResult],
+    raw_count: int,
+    deduped_count: int,
+    recommended: list[ScoreResult],
+    reserve: list[ScoreResult],
+    discarded: list[ScoreResult],
+    output_path: Path,
+) -> str:
+    lines = [
+        "模力指数选题日报",
+        f"{run_date.isoformat()}（周{chinese_weekday(run_date)}）",
+        "",
+        f"采集：6类依据，原始 {raw_count} 条，去重 {deduped_count} 条",
+        f"结论：推荐 {len(recommended)} 条｜储备 {len(reserve)} 条｜放弃 {len(discarded)} 条",
+    ]
+
+    if raw_count == 0 and deduped_count == 0:
+        lines.extend(
+            [
+                "",
+                "今日未检索到可用 GEO 热点。",
+                "",
+                "六类分支结果：",
+            ]
+        )
+        for branch in branches:
+            reason = branch.empty_reason or branch.warning or "empty"
+            lines.append(f"- {branch.topic_type}：0条（{reason}）")
+        lines.extend(
+            [
+                "",
+                "下轮优先追踪：AI搜索广告商业化、国内大模型入口变化、生成式AI监管/备案、GEO服务商交付验收争议。",
+                "",
+                f"完整日报：{output_path}",
+            ]
+        )
+        return truncate_message("\n".join(lines))
+
+    if recommended:
+        lines.extend(["", "推荐选题："])
+        for index, score in enumerate(recommended[:3], start=1):
+            capabilities = "、".join(score.capabilities) if score.capabilities else "待补产品承接"
+            lines.extend(
+                [
+                    f"{index}. {feishu_topic_title(score)}",
+                    f"   角度：{feishu_topic_angle(score)}",
+                    f"   评分：{score.total}/15｜类型：{score.candidate.get('topic_type', '-')}",
+                    f"   能力：{capabilities}",
+                    f"   风险：{generated_risk(score)}",
+                ]
+            )
+    else:
+        lines.extend(["", "推荐选题：无"])
+
+    if reserve:
+        lines.extend(["", "储备选题："])
+        for index, score in enumerate(reserve[:2], start=1):
+            lines.append(f"{index}. {feishu_topic_title(score)}（{score.total}/15，待补事实锚点）")
+
+    if discarded:
+        lines.extend(["", f"放弃：{len(discarded)} 条，主要原因见完整日报。"])
+
+    lines.extend(
+        [
+            "",
+            "完整 Brief 已保存为 Markdown：",
+            str(output_path),
+        ]
+    )
+    return truncate_message("\n".join(lines))
 
 
 def resolve_output_path(run_date: date, output: str | None, overwrite: bool) -> Path:
@@ -912,14 +1131,14 @@ def resolve_output_path(run_date: date, output: str | None, overwrite: bool) -> 
     raise RuntimeError("could not resolve a non-conflicting output path")
 
 
-def send_feishu_if_configured(webhook: str | None, markdown: str) -> str:
+def send_feishu_if_configured(webhook: str | None, message: str) -> str:
     webhook = webhook or os.environ.get("FEISHU_WEBHOOK_URL")
     if not webhook:
         return "未配置 webhook，仅保存 Markdown"
 
     payload = {
         "msg_type": "text",
-        "content": {"text": compact_text(markdown, 3500)},
+        "content": {"text": truncate_message(message)},
     }
     data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     request = urllib.request.Request(
@@ -948,6 +1167,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     scored = [score_candidate(candidate) for candidate in deduped]
     recommended, reserve, discarded = split_scores(scored)
     knowledge_loaded, knowledge_warnings = load_optional_knowledge()
+    llm_targets = recommended[: args.count] + reserve[:2]
+    llm_status, llm_warnings = apply_llm_enhancements(llm_targets, args)
 
     feishu_status = "未配置 webhook，仅保存 Markdown"
     markdown = render_markdown(
@@ -961,10 +1182,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         reserve=reserve,
         discarded=discarded,
         warnings=input_warnings,
-        clean_warnings=clean_warnings,
+        clean_warnings=clean_warnings + llm_warnings,
         knowledge_loaded=knowledge_loaded,
         knowledge_warnings=knowledge_warnings,
         feishu_status=feishu_status,
+        llm_status=llm_status,
     )
 
     output_path = resolve_output_path(run_date, args.output, args.overwrite)
@@ -972,7 +1194,17 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     output_path.write_text(markdown, encoding="utf-8")
 
     if args.feishu_webhook or os.environ.get("FEISHU_WEBHOOK_URL"):
-        feishu_status = send_feishu_if_configured(args.feishu_webhook, markdown)
+        feishu_message = render_feishu_message(
+            run_date=run_date,
+            branches=branches,
+            raw_count=raw_count,
+            deduped_count=len(deduped),
+            recommended=recommended[: args.count],
+            reserve=reserve,
+            discarded=discarded,
+            output_path=output_path,
+        )
+        feishu_status = send_feishu_if_configured(args.feishu_webhook, feishu_message)
         markdown = markdown.replace("飞书推送：未配置 webhook，仅保存 Markdown", f"飞书推送：{feishu_status}")
         output_path.write_text(markdown, encoding="utf-8")
 
@@ -986,6 +1218,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "recommended_count": min(len(recommended), args.count),
         "reserve_count": len(reserve),
         "discarded_count": len(discarded),
+        "llm": llm_status,
         "feishu": feishu_status,
     }
 
@@ -1002,6 +1235,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--min-common-words", type=int, default=5)
     parser.add_argument("--similarity-threshold", type=float, default=0.45)
     parser.add_argument("--feishu-webhook", help="Optional Feishu webhook. If omitted, only Markdown is saved.")
+    parser.add_argument("--use-llm", action="store_true", help="Enable optional LLM enhancement for recommended/reserve topics.")
+    parser.add_argument("--llm-provider", choices=("openai", "deepseek", "dashscope", "moonshot", "custom"), help="LLM provider preset. Defaults to LLM_PROVIDER, or openai unless LLM_BASE_URL is set.")
+    parser.add_argument("--llm-base-url", help="OpenAI-compatible base URL, for example https://api.openai.com/v1.")
+    parser.add_argument("--llm-api-key", help="LLM API key. Prefer environment variables instead of CLI history.")
+    parser.add_argument("--llm-model", help="Model name, for example gpt-4o-mini, deepseek-chat, qwen-plus.")
+    parser.add_argument("--llm-timeout", type=int, default=None)
+    parser.add_argument("--llm-temperature", type=float, default=None)
+    parser.add_argument("--llm-max-tokens", type=int, default=None)
     return parser
 
 
