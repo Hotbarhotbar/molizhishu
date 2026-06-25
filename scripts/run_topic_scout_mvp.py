@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from dedup import dedup_candidates
+from feishu_doc import FeishuDocClient, FeishuDocConfig
 from llm_client import LLMClient, LLMConfig, parse_json_object
 
 
@@ -937,12 +938,14 @@ def render_quality_review(
     knowledge_warnings: list[str],
     feishu_status: str,
     llm_status: str,
+    feishu_doc_status: str,
 ) -> list[str]:
     lines = ["## 搜索质量复盘", ""]
     all_warnings = warnings + branch_warnings + knowledge_warnings
     lines.append(f"- 知识库增强：{'已加载 ' + str(len(knowledge_loaded)) + ' 个文件' if knowledge_loaded else '可选跳过'}")
     lines.append(f"- 模型增强：{llm_status}")
     lines.append("- 历史文章去重：未启用（按MVP要求，本轮不读取已发文章做排除）")
+    lines.append(f"- 飞书云文档：{feishu_doc_status}")
     lines.append(f"- 飞书推送：{feishu_status}")
     if not all_warnings:
         lines.append("- 运行告警：无")
@@ -969,6 +972,7 @@ def render_markdown(
     knowledge_warnings: list[str],
     feishu_status: str,
     llm_status: str,
+    feishu_doc_status: str,
 ) -> str:
     all_empty = raw_count == 0 and cleaned_count == 0 and deduped_count == 0
     conclusion = (
@@ -1016,6 +1020,7 @@ def render_markdown(
             knowledge_warnings=knowledge_warnings,
             feishu_status=feishu_status,
             llm_status=llm_status,
+            feishu_doc_status=feishu_doc_status,
         )
     )
     lines.extend(
@@ -1350,6 +1355,32 @@ def publish_html_brief(markdown: str, output_path: Path, args: argparse.Namespac
     return str(html_path), build_public_url(args.public_base_url, html_filename)
 
 
+def publish_feishu_doc(markdown: str, run_date: date, args: argparse.Namespace) -> tuple[str, str, str]:
+    if not args.publish_feishu_doc:
+        return "未启用", "", ""
+
+    config = FeishuDocConfig.from_sources(
+        app_id=args.feishu_app_id,
+        app_secret=args.feishu_app_secret,
+        folder_token=args.feishu_folder_token,
+        doc_base_url=args.feishu_doc_base_url,
+        timeout=args.feishu_doc_timeout,
+    )
+    missing = config.missing_reason()
+    if missing:
+        return f"已请求但未配置：{missing}", "", missing
+
+    client = FeishuDocClient(config)
+    result = client.publish_markdown(f"模力指数选题日报 {run_date.isoformat()}", markdown)
+    if not result.ok:
+        return f"发布失败：{result.error}", "", result.error
+
+    status = f"已创建 document_id={result.document_id}"
+    if result.warning:
+        status += f"；warning={result.warning}"
+    return status, result.url, result.warning
+
+
 def truncate_message(text: str, limit: int = 3500) -> str:
     text = text.replace("\r\n", "\n").replace("\r", "\n").strip()
     if len(text) <= limit:
@@ -1367,6 +1398,7 @@ def render_feishu_message(
     reserve: list[ScoreResult],
     discarded: list[ScoreResult],
     public_url: str = "",
+    feishu_doc_url: str = "",
 ) -> str:
     lines = [
         "模力指数选题日报",
@@ -1389,7 +1421,9 @@ def render_feishu_message(
             reason = branch.empty_reason or branch.warning or "empty"
             lines.append(f"- {branch.topic_type}：0条（{reason}）")
         lines.extend(["", "下轮优先追踪：AI搜索广告商业化、国内大模型入口变化、生成式AI监管/备案、GEO服务商交付验收争议。"])
-        if public_url:
+        if feishu_doc_url:
+            lines.extend(["", f"完整飞书云文档：{feishu_doc_url}"])
+        elif public_url:
             lines.extend(["", f"完整网页：{public_url}"])
         else:
             lines.extend(["", "群内版已完整说明结论；本地 Markdown 只做归档。"])
@@ -1420,7 +1454,9 @@ def render_feishu_message(
     if discarded:
         lines.extend(["", f"放弃：{len(discarded)} 条，主要原因见完整日报。"])
 
-    if public_url:
+    if feishu_doc_url:
+        lines.extend(["", f"完整飞书云文档：{feishu_doc_url}"])
+    elif public_url:
         lines.extend(["", f"完整网页：{public_url}"])
     else:
         lines.extend(
@@ -1492,6 +1528,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     llm_status, llm_warnings = apply_llm_enhancements(llm_targets, args)
 
     feishu_status = "未配置 webhook，仅保存 Markdown"
+    feishu_doc_status = "未启用"
+    feishu_doc_url = ""
+    feishu_doc_warning = ""
     markdown = render_markdown(
         run_date=run_date,
         fixture=args.fixture,
@@ -1508,11 +1547,33 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         knowledge_warnings=knowledge_warnings,
         feishu_status=feishu_status,
         llm_status=llm_status,
+        feishu_doc_status=feishu_doc_status,
     )
 
     output_path = resolve_output_path(run_date, args.output, args.overwrite)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(markdown, encoding="utf-8")
+    feishu_doc_status, feishu_doc_url, feishu_doc_warning = publish_feishu_doc(markdown, run_date, args)
+    if args.publish_feishu_doc:
+        markdown = render_markdown(
+            run_date=run_date,
+            fixture=args.fixture,
+            branches=branches,
+            raw_count=raw_count,
+            cleaned_count=len(cleaned),
+            deduped_count=len(deduped),
+            recommended=recommended[: args.count],
+            reserve=reserve,
+            discarded=discarded,
+            warnings=input_warnings,
+            clean_warnings=clean_warnings + llm_warnings + ([feishu_doc_warning] if feishu_doc_warning else []),
+            knowledge_loaded=knowledge_loaded,
+            knowledge_warnings=knowledge_warnings,
+            feishu_status=feishu_status,
+            llm_status=llm_status,
+            feishu_doc_status=feishu_doc_status,
+        )
+        output_path.write_text(markdown, encoding="utf-8")
     published_path, public_url = publish_html_brief(markdown, output_path, args)
 
     if args.feishu_webhook or os.environ.get("FEISHU_WEBHOOK_URL"):
@@ -1525,6 +1586,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             reserve=reserve,
             discarded=discarded,
             public_url=public_url,
+            feishu_doc_url=feishu_doc_url,
         )
         feishu_status = send_feishu_if_configured(args.feishu_webhook, feishu_message)
         markdown = markdown.replace("飞书推送：未配置 webhook，仅保存 Markdown", f"飞书推送：{feishu_status}")
@@ -1545,6 +1607,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "reserve_count": len(reserve),
         "discarded_count": len(discarded),
         "llm": llm_status,
+        "feishu_doc": feishu_doc_status,
+        "feishu_doc_url": feishu_doc_url,
         "feishu": feishu_status,
     }
 
@@ -1565,6 +1629,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--min-common-words", type=int, default=5)
     parser.add_argument("--similarity-threshold", type=float, default=0.45)
     parser.add_argument("--feishu-webhook", help="Optional Feishu webhook. If omitted, only Markdown is saved.")
+    parser.add_argument("--publish-feishu-doc", action="store_true", help="Create a Feishu cloud document for the full brief.")
+    parser.add_argument("--feishu-app-id", help="Feishu app id. Prefer FEISHU_APP_ID environment variable.")
+    parser.add_argument("--feishu-app-secret", help="Feishu app secret. Prefer FEISHU_APP_SECRET environment variable.")
+    parser.add_argument("--feishu-folder-token", help="Optional Feishu folder token. Prefer FEISHU_FOLDER_TOKEN environment variable.")
+    parser.add_argument("--feishu-doc-base-url", help="Feishu doc URL prefix, for example https://sample.feishu.cn/docx. Prefer FEISHU_DOC_BASE_URL.")
+    parser.add_argument("--feishu-doc-timeout", type=int, default=None)
     parser.add_argument("--use-llm", action="store_true", help="Enable optional LLM enhancement for recommended/reserve topics.")
     parser.add_argument("--llm-provider", choices=("openai", "deepseek", "dashscope", "moonshot", "custom"), help="LLM provider preset. Defaults to LLM_PROVIDER, or openai unless LLM_BASE_URL is set.")
     parser.add_argument("--llm-base-url", help="OpenAI-compatible base URL, for example https://api.openai.com/v1.")

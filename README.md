@@ -92,6 +92,49 @@ git push
 
 之后飞书消息会带完整网页链接，群成员点击即可查看全部选题。`docs/topic-briefs/index.html` 是日报列表页。
 
+## 飞书云文档发布
+
+如果 GitHub Pages 不方便，推荐用飞书云文档作为完整 Brief 入口。流程：
+
+1. 在飞书开放平台创建企业自建应用。
+2. 在「权限管理」开通以下权限之一：
+   - `docx:document`
+   - `docx:document:create`
+3. 开通权限后重新「创建版本 / 发布版本」。
+4. 在飞书管理后台确认该自建应用已启用，且可用范围包含你自己。
+5. 配置环境变量运行脚本。
+
+基础配置：
+
+```powershell
+$env:FEISHU_APP_ID = "你的 App ID"
+$env:FEISHU_APP_SECRET = "你的 App Secret"
+```
+
+可选配置：
+
+```powershell
+# 指定创建到某个飞书云空间文件夹。使用 tenant_access_token 时，该文件夹通常需要由应用创建，或给应用授权。
+$env:FEISHU_FOLDER_TOKEN = "你的文件夹 token"
+
+# 用于拼出可点击文档链接。格式通常是 https://你的企业域名.feishu.cn/docx
+$env:FEISHU_DOC_BASE_URL = "https://sample.feishu.cn/docx"
+```
+
+运行：
+
+```powershell
+python scripts\run_topic_scout_mvp.py --fixture example --publish-feishu-doc
+```
+
+如果同时配置了飞书 webhook，群消息会优先带「完整飞书云文档」链接。若未配置 `FEISHU_DOC_BASE_URL`，脚本仍会创建文档，但只能返回 `document_id`，无法拼出可点击链接。
+
+权限错误定位：
+
+- `99991672`：应用缺 API 权限。按错误提示去「权限管理」搜索并开通对应 scope，然后重新发布应用版本。
+- `1770040`：指定文件夹无权限。先不传 `FEISHU_FOLDER_TOKEN`，或使用应用创建/授权过的文件夹。
+- 文档创建成功但正文写入失败：通常还需要 `docx:document` 这类编辑权限。
+
 ## 模型 API Key 接口
 
 脚本默认不调用模型，完全可以离线运行。需要用模型增强选题标题、角度和风险提示时，启用 OpenAI-compatible 接口：
