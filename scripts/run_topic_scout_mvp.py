@@ -1311,6 +1311,30 @@ def write_publish_index(publish_dir: Path) -> None:
 """
     (publish_dir / "index.html").write_text(html, encoding="utf-8")
 
+    if publish_dir.name == "topic-briefs" and publish_dir.parent.name == "docs":
+        root_index = """<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>模力指数内容工作流</title>
+  <style>
+    body { margin: 0; font: 15px/1.7 -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif; color: #1f2933; }
+    main { width: min(860px, calc(100% - 32px)); margin: 0 auto; padding: 36px 0 56px; }
+    a { color: #0f766e; text-decoration: none; }
+    a:hover { text-decoration: underline; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>模力指数内容工作流</h1>
+    <p><a href="topic-briefs/">查看选题日报归档</a></p>
+  </main>
+</body>
+</html>
+"""
+        (publish_dir.parent / "index.html").write_text(root_index, encoding="utf-8")
+
 
 def publish_html_brief(markdown: str, output_path: Path, args: argparse.Namespace) -> tuple[str, str]:
     if not args.publish_html:
