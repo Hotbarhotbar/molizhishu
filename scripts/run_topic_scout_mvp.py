@@ -18,6 +18,7 @@ import sys
 import urllib.request
 from dataclasses import dataclass
 from datetime import date, datetime
+from html import escape
 from pathlib import Path
 from typing import Any, Callable
 
@@ -27,6 +28,7 @@ from llm_client import LLMClient, LLMConfig, parse_json_object
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "outputs" / "topic-briefs"
+DEFAULT_PUBLISH_DIR = PROJECT_ROOT / "docs" / "topic-briefs"
 
 
 @dataclass(frozen=True)
@@ -1030,6 +1032,300 @@ def render_markdown(
     return "\n".join(lines)
 
 
+def render_inline_markdown(text: str) -> str:
+    value = escape(text)
+    value = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", value)
+    value = re.sub(r"`([^`]+)`", r"<code>\1</code>", value)
+    return value
+
+
+def parse_markdown_table(lines: list[str], start: int) -> tuple[str, int] | None:
+    if start + 1 >= len(lines):
+        return None
+    header = lines[start].strip()
+    separator = lines[start + 1].strip()
+    if "|" not in header or not re.fullmatch(r"\|?[\s:\-|]+\|?", separator):
+        return None
+
+    table_lines: list[str] = []
+    index = start
+    while index < len(lines) and "|" in lines[index]:
+        table_lines.append(lines[index].strip())
+        index += 1
+
+    def split_row(row: str) -> list[str]:
+        return [cell.strip() for cell in row.strip("|").split("|")]
+
+    header_cells = split_row(table_lines[0])
+    body_rows = [split_row(row) for row in table_lines[2:]]
+    html_lines = ["<table>", "<thead><tr>"]
+    for cell in header_cells:
+        html_lines.append(f"<th>{render_inline_markdown(cell)}</th>")
+    html_lines.extend(["</tr></thead>", "<tbody>"])
+    for row in body_rows:
+        html_lines.append("<tr>")
+        for cell in row:
+            html_lines.append(f"<td>{render_inline_markdown(cell)}</td>")
+        html_lines.append("</tr>")
+    html_lines.extend(["</tbody>", "</table>"])
+    return "\n".join(html_lines), index
+
+
+def markdown_to_html(markdown: str) -> str:
+    lines = markdown.splitlines()
+    html_lines: list[str] = []
+    in_ul = False
+    in_ol = False
+    index = 0
+
+    def close_lists() -> None:
+        nonlocal in_ul, in_ol
+        if in_ul:
+            html_lines.append("</ul>")
+            in_ul = False
+        if in_ol:
+            html_lines.append("</ol>")
+            in_ol = False
+
+    while index < len(lines):
+        raw = lines[index]
+        line = raw.strip()
+
+        if not line:
+            close_lists()
+            index += 1
+            continue
+
+        table = parse_markdown_table(lines, index)
+        if table:
+            close_lists()
+            table_html, index = table
+            html_lines.append(table_html)
+            continue
+
+        heading = re.match(r"^(#{1,4})\s+(.+)$", line)
+        if heading:
+            close_lists()
+            level = len(heading.group(1))
+            html_lines.append(f"<h{level}>{render_inline_markdown(heading.group(2))}</h{level}>")
+            index += 1
+            continue
+
+        if re.fullmatch(r"-{3,}", line):
+            close_lists()
+            html_lines.append("<hr>")
+            index += 1
+            continue
+
+        unordered = re.match(r"^-\s+(.+)$", line)
+        if unordered:
+            if in_ol:
+                html_lines.append("</ol>")
+                in_ol = False
+            if not in_ul:
+                html_lines.append("<ul>")
+                in_ul = True
+            html_lines.append(f"<li>{render_inline_markdown(unordered.group(1))}</li>")
+            index += 1
+            continue
+
+        ordered = re.match(r"^\d+\.\s+(.+)$", line)
+        if ordered:
+            if in_ul:
+                html_lines.append("</ul>")
+                in_ul = False
+            if not in_ol:
+                html_lines.append("<ol>")
+                in_ol = True
+            html_lines.append(f"<li>{render_inline_markdown(ordered.group(1))}</li>")
+            index += 1
+            continue
+
+        close_lists()
+        html_lines.append(f"<p>{render_inline_markdown(line)}</p>")
+        index += 1
+
+    close_lists()
+    return "\n".join(html_lines)
+
+
+def render_html_page(markdown: str, title: str) -> str:
+    body = markdown_to_html(markdown)
+    return f"""<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{escape(title)}</title>
+  <style>
+    :root {{
+      color-scheme: light;
+      --text: #1f2933;
+      --muted: #667085;
+      --line: #d9dee7;
+      --soft: #f6f8fb;
+      --accent: #0f766e;
+    }}
+    body {{
+      margin: 0;
+      background: #ffffff;
+      color: var(--text);
+      font: 15px/1.65 -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif;
+    }}
+    main {{
+      width: min(1120px, calc(100% - 32px));
+      margin: 0 auto;
+      padding: 32px 0 56px;
+    }}
+    h1, h2, h3, h4 {{
+      line-height: 1.35;
+      margin: 28px 0 12px;
+    }}
+    h1 {{
+      font-size: 30px;
+      border-bottom: 2px solid var(--accent);
+      padding-bottom: 12px;
+    }}
+    h2 {{
+      font-size: 22px;
+      margin-top: 34px;
+    }}
+    h3 {{
+      font-size: 18px;
+      color: #243b53;
+    }}
+    p {{
+      margin: 8px 0;
+    }}
+    table {{
+      width: 100%;
+      border-collapse: collapse;
+      margin: 14px 0 22px;
+      font-size: 14px;
+    }}
+    th, td {{
+      border: 1px solid var(--line);
+      padding: 9px 10px;
+      vertical-align: top;
+    }}
+    th {{
+      background: var(--soft);
+      text-align: left;
+      font-weight: 700;
+    }}
+    tr:nth-child(even) td {{
+      background: #fbfcfe;
+    }}
+    ul, ol {{
+      padding-left: 24px;
+    }}
+    code {{
+      background: var(--soft);
+      border: 1px solid var(--line);
+      border-radius: 4px;
+      padding: 1px 4px;
+      font-family: Consolas, "SFMono-Regular", monospace;
+      font-size: 0.92em;
+    }}
+    hr {{
+      border: 0;
+      border-top: 1px solid var(--line);
+      margin: 28px 0;
+    }}
+    .page-meta {{
+      color: var(--muted);
+      font-size: 13px;
+      margin-bottom: 18px;
+    }}
+    @media (max-width: 720px) {{
+      body {{ font-size: 14px; }}
+      main {{ width: calc(100% - 20px); padding-top: 18px; }}
+      h1 {{ font-size: 24px; }}
+      table {{ display: block; overflow-x: auto; white-space: nowrap; }}
+      th, td {{ white-space: normal; min-width: 120px; }}
+    }}
+  </style>
+</head>
+<body>
+  <main>
+    <div class="page-meta">Generated by molizhishu topic scout</div>
+{body}
+  </main>
+</body>
+</html>
+"""
+
+
+def resolve_publish_dir(value: str | None) -> Path:
+    if value:
+        path = Path(value)
+        if not path.is_absolute():
+            path = PROJECT_ROOT / path
+        return path
+    return DEFAULT_PUBLISH_DIR
+
+
+def build_public_url(public_base_url: str | None, filename: str) -> str:
+    base = (public_base_url or os.environ.get("PUBLIC_BASE_URL") or "").strip().rstrip("/")
+    if not base:
+        return ""
+    return f"{base}/{filename}"
+
+
+def sanitize_slug(value: str) -> str:
+    slug = re.sub(r"[^a-zA-Z0-9._-]+", "-", value.strip())
+    return slug.strip("-") or "topic-brief"
+
+
+def write_publish_index(publish_dir: Path) -> None:
+    pages = sorted(publish_dir.glob("*.html"), key=lambda path: path.name, reverse=True)
+    rows = "\n".join(
+        f'<li><a href="{escape(path.name)}">{escape(path.stem)}</a></li>'
+        for path in pages
+        if path.name != "index.html"
+    )
+    html = f"""<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>模力指数选题日报归档</title>
+  <style>
+    body {{ margin: 0; font: 15px/1.7 -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif; color: #1f2933; }}
+    main {{ width: min(860px, calc(100% - 32px)); margin: 0 auto; padding: 36px 0 56px; }}
+    h1 {{ font-size: 28px; }}
+    li {{ margin: 8px 0; }}
+    a {{ color: #0f766e; text-decoration: none; }}
+    a:hover {{ text-decoration: underline; }}
+  </style>
+</head>
+<body>
+  <main>
+    <h1>模力指数选题日报归档</h1>
+    <ul>
+      {rows or '<li>暂无日报</li>'}
+    </ul>
+  </main>
+</body>
+</html>
+"""
+    (publish_dir / "index.html").write_text(html, encoding="utf-8")
+
+
+def publish_html_brief(markdown: str, output_path: Path, args: argparse.Namespace) -> tuple[str, str]:
+    if not args.publish_html:
+        return "", ""
+
+    publish_dir = resolve_publish_dir(args.publish_dir)
+    publish_dir.mkdir(parents=True, exist_ok=True)
+    html_stem = sanitize_slug(args.publish_slug) if args.publish_slug else output_path.stem
+    html_filename = f"{html_stem}.html"
+    html_path = publish_dir / html_filename
+    html_path.write_text(render_html_page(markdown, output_path.stem), encoding="utf-8")
+    write_publish_index(publish_dir)
+    return str(html_path), build_public_url(args.public_base_url, html_filename)
+
+
 def truncate_message(text: str, limit: int = 3500) -> str:
     text = text.replace("\r\n", "\n").replace("\r", "\n").strip()
     if len(text) <= limit:
@@ -1046,6 +1342,7 @@ def render_feishu_message(
     recommended: list[ScoreResult],
     reserve: list[ScoreResult],
     discarded: list[ScoreResult],
+    public_url: str = "",
 ) -> str:
     lines = [
         "模力指数选题日报",
@@ -1067,14 +1364,11 @@ def render_feishu_message(
         for branch in branches:
             reason = branch.empty_reason or branch.warning or "empty"
             lines.append(f"- {branch.topic_type}：0条（{reason}）")
-        lines.extend(
-            [
-                "",
-                "下轮优先追踪：AI搜索广告商业化、国内大模型入口变化、生成式AI监管/备案、GEO服务商交付验收争议。",
-                "",
-                "群内版已完整说明结论；本地 Markdown 只做归档，不作为群成员打开入口。",
-            ]
-        )
+        lines.extend(["", "下轮优先追踪：AI搜索广告商业化、国内大模型入口变化、生成式AI监管/备案、GEO服务商交付验收争议。"])
+        if public_url:
+            lines.extend(["", f"完整网页：{public_url}"])
+        else:
+            lines.extend(["", "群内版已完整说明结论；本地 Markdown 只做归档。"])
         return truncate_message("\n".join(lines))
 
     if recommended:
@@ -1102,13 +1396,16 @@ def render_feishu_message(
     if discarded:
         lines.extend(["", f"放弃：{len(discarded)} 条，主要原因见完整日报。"])
 
-    lines.extend(
-        [
-            "",
-            "群内版已包含决策摘要；Markdown 完整明细保存在运行机器本地归档。",
-            "如需群成员打开完整文档，建议下一步接飞书云文档 API 或发布到团队可访问的网页/GitHub 地址。",
-        ]
-    )
+    if public_url:
+        lines.extend(["", f"完整网页：{public_url}"])
+    else:
+        lines.extend(
+            [
+                "",
+                "群内版已包含决策摘要；Markdown 完整明细保存在运行机器本地归档。",
+                "如需群成员打开完整文档，请启用 --publish-html 并配置 --public-base-url。",
+            ]
+        )
     return truncate_message("\n".join(lines))
 
 
@@ -1192,6 +1489,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     output_path = resolve_output_path(run_date, args.output, args.overwrite)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(markdown, encoding="utf-8")
+    published_path, public_url = publish_html_brief(markdown, output_path, args)
 
     if args.feishu_webhook or os.environ.get("FEISHU_WEBHOOK_URL"):
         feishu_message = render_feishu_message(
@@ -1202,14 +1500,19 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             recommended=recommended[: args.count],
             reserve=reserve,
             discarded=discarded,
+            public_url=public_url,
         )
         feishu_status = send_feishu_if_configured(args.feishu_webhook, feishu_message)
         markdown = markdown.replace("飞书推送：未配置 webhook，仅保存 Markdown", f"飞书推送：{feishu_status}")
         output_path.write_text(markdown, encoding="utf-8")
+        if args.publish_html:
+            published_path, public_url = publish_html_brief(markdown, output_path, args)
 
     return {
         "status": "ok",
         "output_path": str(output_path),
+        "published_path": published_path,
+        "public_url": public_url,
         "fixture": args.fixture,
         "raw_count": raw_count,
         "cleaned_count": len(cleaned),
@@ -1228,6 +1531,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--input-json", help="Local JSON input used when --fixture file is selected.")
     parser.add_argument("--date", help="Report date in YYYY-MM-DD format. Defaults to today.")
     parser.add_argument("--output", help="Output Markdown path. Defaults to outputs/topic-briefs/YYYY-MM-DD-topic-brief.md.")
+    parser.add_argument("--publish-html", action="store_true", help="Also render the full brief as a static HTML page.")
+    parser.add_argument("--publish-dir", default=str(Path("docs") / "topic-briefs"), help="Directory for published HTML pages. Defaults to docs/topic-briefs.")
+    parser.add_argument("--publish-slug", help="Optional stable HTML filename stem, for example 2026-06-25-topic-brief.")
+    parser.add_argument("--public-base-url", help="Public URL prefix for published pages, for example https://user.github.io/repo/topic-briefs.")
     parser.add_argument("--overwrite", action="store_true", help="Allow overwriting the preferred dated output file.")
     parser.add_argument("--count", type=int, default=3, help="Maximum recommended topics to render.")
     parser.add_argument("--max-candidates", type=int, default=20)

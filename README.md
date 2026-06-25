@@ -64,6 +64,34 @@ python scripts\run_topic_scout_mvp.py --fixture example --feishu-webhook "https:
 2. **团队可访问网页**：把日报发布到内网、对象存储、GitHub Pages 或其他静态站点，再推 URL。最简单稳定，但需要一个可访问的发布位置。
 3. **飞书文件上传**：用飞书文件/素材接口上传 Markdown 或 PDF，再发到群里。比 webhook 复杂，需要应用 token，不适合只靠自定义机器人 webhook 完成。
 
+## 完整网页发布
+
+推荐第一版用 GitHub Pages 承载完整选题页。脚本会把 Markdown 同步渲染成静态 HTML，输出到 `docs/topic-briefs/`：
+
+```powershell
+python scripts\run_topic_scout_mvp.py `
+  --fixture example `
+  --publish-html `
+  --public-base-url "https://hotbarhotbar.github.io/molizhishu/topic-briefs"
+```
+
+生成后提交并推送：
+
+```powershell
+git add docs README.md scripts
+git commit -m "Publish topic brief pages"
+git push
+```
+
+第一次使用需要在 GitHub 仓库里启用 Pages：
+
+1. 打开 `https://github.com/Hotbarhotbar/molizhishu/settings/pages`
+2. Source 选择 `Deploy from a branch`
+3. Branch 选择 `main`，目录选择 `/docs`
+4. 保存后等 1-2 分钟
+
+之后飞书消息会带完整网页链接，群成员点击即可查看全部选题。`docs/topic-briefs/index.html` 是日报列表页。
+
 ## 模型 API Key 接口
 
 脚本默认不调用模型，完全可以离线运行。需要用模型增强选题标题、角度和风险提示时，启用 OpenAI-compatible 接口：
