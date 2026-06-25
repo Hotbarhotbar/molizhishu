@@ -1034,7 +1034,7 @@ def truncate_message(text: str, limit: int = 3500) -> str:
     text = text.replace("\r\n", "\n").replace("\r", "\n").strip()
     if len(text) <= limit:
         return text
-    suffix = "\n\n（消息过长，已截断；完整内容见本地 Markdown 日报。）"
+    suffix = "\n\n（消息过长，已截断；完整明细已在运行机器本地归档。）"
     return text[: limit - len(suffix)].rstrip() + suffix
 
 
@@ -1046,7 +1046,6 @@ def render_feishu_message(
     recommended: list[ScoreResult],
     reserve: list[ScoreResult],
     discarded: list[ScoreResult],
-    output_path: Path,
 ) -> str:
     lines = [
         "模力指数选题日报",
@@ -1073,7 +1072,7 @@ def render_feishu_message(
                 "",
                 "下轮优先追踪：AI搜索广告商业化、国内大模型入口变化、生成式AI监管/备案、GEO服务商交付验收争议。",
                 "",
-                f"完整日报：{output_path}",
+                "群内版已完整说明结论；本地 Markdown 只做归档，不作为群成员打开入口。",
             ]
         )
         return truncate_message("\n".join(lines))
@@ -1087,6 +1086,7 @@ def render_feishu_message(
                     f"{index}. {feishu_topic_title(score)}",
                     f"   角度：{feishu_topic_angle(score)}",
                     f"   评分：{score.total}/15｜类型：{score.candidate.get('topic_type', '-')}",
+                    f"   依据：{compact_text(score.candidate.get('snippet', ''), 90) or '待补事实摘要'}",
                     f"   能力：{capabilities}",
                     f"   风险：{generated_risk(score)}",
                 ]
@@ -1105,8 +1105,8 @@ def render_feishu_message(
     lines.extend(
         [
             "",
-            "完整 Brief 已保存为 Markdown：",
-            str(output_path),
+            "群内版已包含决策摘要；Markdown 完整明细保存在运行机器本地归档。",
+            "如需群成员打开完整文档，建议下一步接飞书云文档 API 或发布到团队可访问的网页/GitHub 地址。",
         ]
     )
     return truncate_message("\n".join(lines))
@@ -1202,7 +1202,6 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             recommended=recommended[: args.count],
             reserve=reserve,
             discarded=discarded,
-            output_path=output_path,
         )
         feishu_status = send_feishu_if_configured(args.feishu_webhook, feishu_message)
         markdown = markdown.replace("飞书推送：未配置 webhook，仅保存 Markdown", f"飞书推送：{feishu_status}")
