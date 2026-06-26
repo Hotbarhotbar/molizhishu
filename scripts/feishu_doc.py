@@ -144,37 +144,43 @@ class FeishuDocClient:
             return f"{self.config.doc_base_url}/{document_id}"
         return ""
 
-    def append_plain_text(self, document_id: str, markdown: str) -> str:
-        lines = markdown_to_plain_doc_lines(markdown)
-        if not lines:
+    def append_blocks(self, document_id: str, blocks: list[dict[str, Any]]) -> str:
+        if not blocks:
             return ""
 
         warnings: list[str] = []
         index = 0
-        for chunk in chunks(lines, 40):
-            children = [text_block(line) for line in chunk]
-            payload = {"index": index, "children": children}
+        for chunk in chunks(blocks, 40):
+            payload = {"index": index, "children": chunk}
             try:
                 self.request_json(
                     "POST",
                     f"/docx/v1/documents/{document_id}/blocks/{document_id}/children",
                     payload,
                 )
-                index += len(children)
+                index += len(chunk)
                 time.sleep(0.35)
             except RuntimeError as exc:
                 warnings.append(str(exc))
                 break
         return "；".join(warnings)
 
-    def publish_markdown(self, title: str, markdown: str) -> FeishuDocResult:
+    def append_plain_text(self, document_id: str, markdown: str) -> str:
+        lines = markdown_to_plain_doc_lines(markdown)
+        return self.append_blocks(document_id, [text_block(line) for line in lines])
+
+    def publish_blocks(self, title: str, blocks: list[dict[str, Any]]) -> FeishuDocResult:
         try:
             document = self.create_document(title)
             document_id = document.get("document_id", "")
             if not document_id:
                 return FeishuDocResult(ok=False, error="document_id_missing", raw=document)
 
-            warning = self.append_plain_text(document_id, markdown)
+            warning = self.append_blocks(document_id, blocks)
+            if warning and any(block.get("block_type") != 2 for block in blocks):
+                retry_warning = self.append_blocks(document_id, [as_plain_text_block(block) for block in blocks])
+                warning = f"{warning}；已回退为普通文本重试：{retry_warning}" if retry_warning else "标题块写入失败，已回退为普通文本"
+
             url = self.document_url(document_id)
             if not url:
                 missing_url = "FEISHU_DOC_BASE_URL 未配置，已创建文档但无法拼出可点击链接"
@@ -190,6 +196,9 @@ class FeishuDocClient:
             )
         except RuntimeError as exc:
             return FeishuDocResult(ok=False, error=str(exc))
+
+    def publish_markdown(self, title: str, markdown: str) -> FeishuDocResult:
+        return self.publish_blocks(title, [text_block(line) for line in markdown_to_plain_doc_lines(markdown)])
 
 
 def chunks(items: list[str], size: int):
@@ -241,3 +250,38 @@ def text_block(content: str) -> dict[str, Any]:
             "style": {},
         },
     }
+
+
+def heading_block(content: str, level: int = 2) -> dict[str, Any]:
+    level = max(1, min(9, level))
+    return {
+        "block_type": 2 + level,
+        f"heading{level}": {
+            "elements": [
+                {
+                    "text_run": {
+                        "content": content,
+                        "text_element_style": {},
+                    }
+                }
+            ],
+            "style": {},
+        },
+    }
+
+
+def as_plain_text_block(block: dict[str, Any]) -> dict[str, Any]:
+    text = ""
+    try:
+        rich_text = block.get("text") or next(
+            (value for key, value in block.items() if key.startswith("heading") and isinstance(value, dict)),
+            {},
+        )
+        elements = rich_text.get("elements", [])
+        text = "".join(
+            element.get("text_run", {}).get("content", "")
+            for element in elements
+        )
+    except Exception:
+        text = str(block)
+    return text_block(text)

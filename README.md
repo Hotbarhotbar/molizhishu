@@ -25,6 +25,14 @@ python scripts\run_topic_scout_mvp.py --fixture empty
 python scripts\run_topic_scout_mvp.py --fixture example
 ```
 
+真实热点采集：
+
+```powershell
+python scripts\run_topic_scout_mvp.py --fixture live
+```
+
+`live` 模式会尝试采集 36氪 RSS、虎嗅 RSS、百度热搜和微信搜狗搜索。任一来源失败只记录 warning，不中断整体日报。
+
 使用本地 JSON 输入：
 
 ```powershell
@@ -125,6 +133,14 @@ $env:FEISHU_DOC_BASE_URL = "https://sample.feishu.cn/docx"
 
 ```powershell
 python scripts\run_topic_scout_mvp.py --fixture example --publish-feishu-doc
+```
+
+飞书云文档默认写成简洁榜单：标题使用飞书标题块，正文只保留分数、痛点对应、为什么值得写、事实依据、风险提示和来源。完整细节仍保存在 Markdown/HTML 归档。
+
+真实热点采集 + 创建云文档：
+
+```powershell
+python scripts\run_topic_scout_mvp.py --fixture live --publish-feishu-doc --feishu-doc-count 8
 ```
 
 如果同时配置了飞书 webhook，群消息会优先带「完整飞书云文档」链接。若未配置 `FEISHU_DOC_BASE_URL`，脚本仍会创建文档，但只能返回 `document_id`，无法拼出可点击链接。

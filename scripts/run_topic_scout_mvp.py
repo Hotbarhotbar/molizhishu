@@ -15,21 +15,24 @@ import json
 import os
 import re
 import sys
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from datetime import date, datetime
-from html import escape
+from html import escape, unescape
 from pathlib import Path
 from typing import Any, Callable
+from xml.etree import ElementTree as ET
 
 from dedup import dedup_candidates
-from feishu_doc import FeishuDocClient, FeishuDocConfig
+from feishu_doc import FeishuDocClient, FeishuDocConfig, heading_block, text_block
 from llm_client import LLMClient, LLMConfig, parse_json_object
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "outputs" / "topic-briefs"
 DEFAULT_PUBLISH_DIR = PROJECT_ROOT / "docs" / "topic-briefs"
+LIVE_SOURCE_CACHE: dict[str, tuple[list[dict[str, Any]], str]] = {}
 
 
 @dataclass(frozen=True)
@@ -379,6 +382,233 @@ def as_item_list(value: Any) -> list[dict[str, Any]]:
     return []
 
 
+def http_get_text(url: str, timeout: int = 15, headers: dict[str, str] | None = None) -> str:
+    request_headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Accept": "text/html,application/json,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+    }
+    if headers:
+        request_headers.update(headers)
+    request = urllib.request.Request(url, headers=request_headers)
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        raw = response.read()
+        charset = response.headers.get_content_charset() or "utf-8"
+        return raw.decode(charset, errors="replace")
+
+
+def strip_html(text: str) -> str:
+    text = unescape(text or "")
+    text = re.sub(r"<script[\s\S]*?</script>", " ", text, flags=re.I)
+    text = re.sub(r"<style[\s\S]*?</style>", " ", text, flags=re.I)
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+
+def fetch_rss_items(url: str, source: str, limit: int = 20) -> tuple[list[dict[str, Any]], str]:
+    cache_key = f"rss:{source}:{url}:{limit}"
+    if cache_key in LIVE_SOURCE_CACHE:
+        items, warning = LIVE_SOURCE_CACHE[cache_key]
+        return [dict(item) for item in items], warning
+    try:
+        xml_text = http_get_text(url)
+        root = ET.fromstring(xml_text)
+        items: list[dict[str, Any]] = []
+        for item in root.iter("item"):
+            values: dict[str, str] = {}
+            for child in item:
+                tag = child.tag.split("}")[-1] if "}" in child.tag else child.tag
+                values[tag] = (child.text or "").strip()
+            title = values.get("title", "")
+            link = values.get("link", "")
+            if not title:
+                continue
+            items.append(
+                {
+                    "title": strip_html(title),
+                    "snippet": strip_html(values.get("description", ""))[:260],
+                    "url": link,
+                    "date": values.get("pubDate", ""),
+                    "source": source,
+                }
+            )
+            if len(items) >= limit:
+                break
+        LIVE_SOURCE_CACHE[cache_key] = (items, "")
+        return [dict(item) for item in items], ""
+    except Exception as exc:
+        warning = f"{source}_rss_failed: {exc}"
+        LIVE_SOURCE_CACHE[cache_key] = ([], warning)
+        return [], warning
+
+
+def fetch_baidu_hot(limit: int = 30) -> tuple[list[dict[str, Any]], str]:
+    cache_key = f"baidu_hot:{limit}"
+    if cache_key in LIVE_SOURCE_CACHE:
+        items, warning = LIVE_SOURCE_CACHE[cache_key]
+        return [dict(item) for item in items], warning
+    try:
+        text = http_get_text(
+            "https://top.baidu.com/api/board?tab=realtime",
+            headers={"Referer": "https://top.baidu.com/", "Accept": "application/json"},
+        )
+        data = json.loads(text)
+        items: list[dict[str, Any]] = []
+        for card in data.get("data", {}).get("cards", []):
+            for entry in card.get("content", []):
+                title = entry.get("word") or entry.get("query") or ""
+                if not title:
+                    continue
+                items.append(
+                    {
+                        "title": title,
+                        "snippet": entry.get("desc", "")[:260],
+                        "url": entry.get("url") or entry.get("rawUrl") or "",
+                        "hot_score": str(entry.get("hotScore") or entry.get("hot_score") or ""),
+                        "source": "百度热搜",
+                    }
+                )
+                if len(items) >= limit:
+                    LIVE_SOURCE_CACHE[cache_key] = (items, "")
+                    return [dict(item) for item in items], ""
+        warning = "" if items else "baidu_hot_empty"
+        LIVE_SOURCE_CACHE[cache_key] = (items, warning)
+        return [dict(item) for item in items], warning
+    except Exception as exc:
+        warning = f"baidu_hot_failed: {exc}"
+        LIVE_SOURCE_CACHE[cache_key] = ([], warning)
+        return [], warning
+
+
+def fetch_wechat_search(query: str, limit: int = 5) -> tuple[list[dict[str, Any]], str]:
+    if not query.strip():
+        return [], "empty_query"
+    cache_key = f"wechat:{query}:{limit}"
+    if cache_key in LIVE_SOURCE_CACHE:
+        items, warning = LIVE_SOURCE_CACHE[cache_key]
+        return [dict(item) for item in items], warning
+    try:
+        url = "https://weixin.sogou.com/weixin?" + urllib.parse.urlencode(
+            {"type": 2, "query": query, "page": 1, "ie": "utf8"}
+        )
+        html = http_get_text(
+            url,
+            headers={
+                "Referer": "https://weixin.sogou.com/",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            },
+        )
+        items: list[dict[str, Any]] = []
+        blocks = re.findall(r"<li[^>]*id=[\"']sogou_vr_11002601_box_\d+[\s\S]*?</li>", html, flags=re.I)
+        if not blocks:
+            blocks = re.findall(r"<div[^>]*class=[\"'][^\"']*txt-box[^\"']*[\"'][\s\S]*?</div>", html, flags=re.I)
+        for block in blocks[:limit]:
+            title_match = re.search(r"<h3[^>]*>[\s\S]*?<a[^>]*href=[\"']([^\"']+)[\"'][^>]*>([\s\S]*?)</a>", block, flags=re.I)
+            if not title_match:
+                title_match = re.search(r"<a[^>]*href=[\"']([^\"']+)[\"'][^>]*>([\s\S]*?)</a>", block, flags=re.I)
+            if not title_match:
+                continue
+            snippet_match = re.search(r"<p[^>]*class=[\"'][^\"']*txt-info[^\"']*[\"'][^>]*>([\s\S]*?)</p>", block, flags=re.I)
+            account_match = re.search(r"<a[^>]*class=[\"'][^\"']*account[^\"']*[\"'][^>]*>([\s\S]*?)</a>", block, flags=re.I)
+            date_match = re.search(r"<span[^>]*class=[\"'][^\"']*s2[^\"']*[\"'][^>]*>([\s\S]*?)</span>", block, flags=re.I)
+            title = strip_html(title_match.group(2))
+            if not title:
+                continue
+            items.append(
+                {
+                    "title": title,
+                    "snippet": strip_html(snippet_match.group(1))[:260] if snippet_match else "",
+                    "url": unescape(title_match.group(1)),
+                    "account": strip_html(account_match.group(1)) if account_match else "",
+                    "date": strip_html(date_match.group(1)) if date_match else "",
+                    "source": "微信搜一搜",
+                }
+            )
+        warning = "" if items else "wechat_search_empty"
+        LIVE_SOURCE_CACHE[cache_key] = (items, warning)
+        return [dict(item) for item in items], warning
+    except Exception as exc:
+        warning = f"wechat_search_failed: {exc}"
+        LIVE_SOURCE_CACHE[cache_key] = ([], warning)
+        return [], warning
+
+
+def keyword_score(item: dict[str, Any], query: str) -> float:
+    text_title = str(item.get("title", "")).lower()
+    text_body = f"{item.get('snippet', '')} {item.get('source', '')}".lower()
+    keywords = [kw.strip().lower() for kw in re.split(r"[\s,，、/]+", query) if kw.strip()]
+    if not keywords:
+        return 0.0
+    score = 0.0
+    for keyword in keywords:
+        if keyword in text_title:
+            score += 3
+        if keyword in text_body:
+            score += 1
+        if len(keyword) >= 3 and keyword[:2] in text_title:
+            score += 0.5
+    return score
+
+
+def pick_relevant_items(
+    pool: list[dict[str, Any]],
+    category: TopicCategory,
+    limit: int,
+) -> list[dict[str, Any]]:
+    scored: list[tuple[float, dict[str, Any]]] = []
+    for item in pool:
+        best = max((keyword_score(item, query) for query in category.queries), default=0)
+        geo_bonus = 1 if contains_any(f"{item.get('title', '')} {item.get('snippet', '')}", GEO_KEYWORDS) else 0
+        final_score = best + geo_bonus
+        if final_score > 0:
+            item = dict(item)
+            item["live_relevance_score"] = round(final_score, 2)
+            scored.append((final_score, item))
+    scored.sort(key=lambda pair: pair[0], reverse=True)
+    return [item for _, item in scored[:limit]]
+
+
+def collect_live_fixture(category: TopicCategory, _: dict[str, Any] | list[Any] | None = None) -> BranchResult:
+    warnings: list[str] = []
+    pool: list[dict[str, Any]] = []
+
+    for url, source in (
+        ("https://36kr.com/feed", "36氪"),
+        ("https://www.huxiu.com/rss/0.xml", "虎嗅"),
+    ):
+        items, warning = fetch_rss_items(url, source, limit=20)
+        pool.extend(items)
+        if warning:
+            warnings.append(warning)
+
+    hot_items, hot_warning = fetch_baidu_hot(limit=30)
+    pool.extend(hot_items)
+    if hot_warning:
+        warnings.append(hot_warning)
+
+    wechat_queries = [category.queries[0]]
+    if category.key in {"industry", "market_hotspot", "product_feature"}:
+        wechat_queries.append(category.queries[-1])
+    for query in wechat_queries[:2]:
+        items, warning = fetch_wechat_search(query, limit=5)
+        pool.extend(items)
+        if warning and warning != "wechat_search_empty":
+            warnings.append(f"{query}: {warning}")
+
+    items = pick_relevant_items(pool, category, limit=8)
+    return BranchResult(
+        key=category.key,
+        topic_type=category.topic_type,
+        query=" / ".join(category.queries),
+        search_target=category.search_target,
+        translation_chain=category.translation_chain,
+        items=items,
+        empty_reason="" if items else "live_no_relevant_items",
+        warning="；".join(warnings[:4]),
+    )
+
+
 def collect_empty_fixture(category: TopicCategory, _: dict[str, Any] | None = None) -> BranchResult:
     return BranchResult(
         key=category.key,
@@ -462,6 +692,7 @@ def collect_branches(args: argparse.Namespace) -> tuple[list[BranchResult], list
         "empty": collect_empty_fixture,
         "example": collect_example_fixture,
         "file": collect_from_local_json,
+        "live": collect_live_fixture,
     }
 
     if args.fixture == "file":
@@ -1355,7 +1586,80 @@ def publish_html_brief(markdown: str, output_path: Path, args: argparse.Namespac
     return str(html_path), build_public_url(args.public_base_url, html_filename)
 
 
-def publish_feishu_doc(markdown: str, run_date: date, args: argparse.Namespace) -> tuple[str, str, str]:
+def source_line(score: ScoreResult) -> str:
+    candidate = score.candidate
+    source = compact_text(candidate.get("source") or "未知来源", 40)
+    url = compact_text(candidate.get("url"), 160)
+    return f"来源：{source}" + (f" {url}" if url else "")
+
+
+def build_compact_feishu_doc_blocks(
+    run_date: date,
+    raw_count: int,
+    deduped_count: int,
+    branches: list[BranchResult],
+    recommended: list[ScoreResult],
+    reserve: list[ScoreResult],
+    discarded: list[ScoreResult],
+    max_topics: int,
+) -> list[dict[str, Any]]:
+    blocks: list[dict[str, Any]] = [
+        heading_block(f"模力指数今日选题｜{run_date.isoformat()}（周{chinese_weekday(run_date)}）", level=1),
+        text_block(f"采集：6类依据｜原始 {raw_count} 条｜去重 {deduped_count} 条｜推荐 {len(recommended)} 条｜储备 {len(reserve)} 条｜放弃 {len(discarded)} 条"),
+        text_block("用途：群里先看摘要；完整写作前再补事实核验和原文链接。"),
+        heading_block("推荐写", level=2),
+    ]
+
+    if not recommended:
+        blocks.append(text_block("今日暂无推荐写选题。"))
+
+    for index, score in enumerate(recommended[:max_topics], start=1):
+        capabilities = "、".join(score.capabilities) if score.capabilities else "待补产品承接"
+        blocks.extend(
+            [
+                heading_block(f"{index}. {compact_text(generated_title_direction(score), 56)}", level=2),
+                text_block(f"分数：{score.total}/15｜类型：{score.candidate.get('topic_type', '-')}｜能力：{capabilities}"),
+                text_block(f"痛点对应：{compact_text(generated_service_hook(score), 70)}"),
+                text_block(f"为什么值得写：{compact_text(generated_angle(score), 90)}"),
+                text_block(f"事实依据：{compact_text(score.candidate.get('snippet', ''), 140) or '待补事实摘要'}"),
+                text_block(f"风险提示：{compact_text(generated_risk(score), 100)}"),
+                text_block(source_line(score)),
+            ]
+        )
+
+    blocks.append(heading_block("储备选题", level=2))
+    if reserve:
+        for index, score in enumerate(reserve[:5], start=1):
+            blocks.append(text_block(f"{index}. {compact_text(generated_title_direction(score), 70)}｜{score.total}/15｜{score.reason}"))
+    else:
+        blocks.append(text_block("暂无储备选题。"))
+
+    blocks.append(heading_block("放弃概览", level=2))
+    if discarded:
+        for index, score in enumerate(discarded[:5], start=1):
+            blocks.append(text_block(f"{index}. {compact_text(score.candidate.get('title', ''), 70)}｜{score.reason}"))
+    else:
+        blocks.append(text_block("暂无放弃选题。"))
+
+    blocks.append(heading_block("采集复盘", level=2))
+    for branch in branches:
+        status = branch.warning or branch.empty_reason or "ok"
+        blocks.append(text_block(f"{branch.topic_type}：{len(branch.items)} 条｜{compact_text(status, 90)}"))
+
+    return blocks
+
+
+def publish_feishu_doc(
+    markdown: str,
+    run_date: date,
+    args: argparse.Namespace,
+    raw_count: int,
+    deduped_count: int,
+    branches: list[BranchResult],
+    recommended: list[ScoreResult],
+    reserve: list[ScoreResult],
+    discarded: list[ScoreResult],
+) -> tuple[str, str, str]:
     if not args.publish_feishu_doc:
         return "未启用", "", ""
 
@@ -1371,7 +1675,17 @@ def publish_feishu_doc(markdown: str, run_date: date, args: argparse.Namespace) 
         return f"已请求但未配置：{missing}", "", missing
 
     client = FeishuDocClient(config)
-    result = client.publish_markdown(f"模力指数选题日报 {run_date.isoformat()}", markdown)
+    blocks = build_compact_feishu_doc_blocks(
+        run_date=run_date,
+        raw_count=raw_count,
+        deduped_count=deduped_count,
+        branches=branches,
+        recommended=recommended,
+        reserve=reserve,
+        discarded=discarded,
+        max_topics=args.feishu_doc_count,
+    )
+    result = client.publish_blocks(f"模力指数选题日报 {run_date.isoformat()}", blocks)
     if not result.ok:
         return f"发布失败：{result.error}", "", result.error
 
@@ -1553,7 +1867,17 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     output_path = resolve_output_path(run_date, args.output, args.overwrite)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(markdown, encoding="utf-8")
-    feishu_doc_status, feishu_doc_url, feishu_doc_warning = publish_feishu_doc(markdown, run_date, args)
+    feishu_doc_status, feishu_doc_url, feishu_doc_warning = publish_feishu_doc(
+        markdown=markdown,
+        run_date=run_date,
+        args=args,
+        raw_count=raw_count,
+        deduped_count=len(deduped),
+        branches=branches,
+        recommended=recommended,
+        reserve=reserve,
+        discarded=discarded,
+    )
     if args.publish_feishu_doc:
         markdown = render_markdown(
             run_date=run_date,
@@ -1615,7 +1939,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run the offline GEO topic scout MVP workflow.")
-    parser.add_argument("--fixture", choices=("empty", "example", "file"), default="empty")
+    parser.add_argument("--fixture", choices=("empty", "example", "file", "live"), default="empty")
     parser.add_argument("--input-json", help="Local JSON input used when --fixture file is selected.")
     parser.add_argument("--date", help="Report date in YYYY-MM-DD format. Defaults to today.")
     parser.add_argument("--output", help="Output Markdown path. Defaults to outputs/topic-briefs/YYYY-MM-DD-topic-brief.md.")
@@ -1635,6 +1959,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--feishu-folder-token", help="Optional Feishu folder token. Prefer FEISHU_FOLDER_TOKEN environment variable.")
     parser.add_argument("--feishu-doc-base-url", help="Feishu doc URL prefix, for example https://sample.feishu.cn/docx. Prefer FEISHU_DOC_BASE_URL.")
     parser.add_argument("--feishu-doc-timeout", type=int, default=None)
+    parser.add_argument("--feishu-doc-count", type=int, default=8, help="Maximum recommended topics rendered in the Feishu cloud document.")
     parser.add_argument("--use-llm", action="store_true", help="Enable optional LLM enhancement for recommended/reserve topics.")
     parser.add_argument("--llm-provider", choices=("openai", "deepseek", "dashscope", "moonshot", "custom"), help="LLM provider preset. Defaults to LLM_PROVIDER, or openai unless LLM_BASE_URL is set.")
     parser.add_argument("--llm-base-url", help="OpenAI-compatible base URL, for example https://api.openai.com/v1.")
